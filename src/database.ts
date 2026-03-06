@@ -24,4 +24,31 @@ if (isProduction) {
     });
 }
 
+export async function initDB(): Promise<void> {
+    try {
+        const client = await pool.connect();
+        console.log("Connected to PostgreSQL.");
+        client.release();
+
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS contacts (
+                id SERIAL PRIMARY KEY,
+                "phoneNumber" TEXT,
+                email TEXT,
+                "linkedId" INTEGER REFERENCES contacts(id),
+                "linkPrecedence" TEXT CHECK ("linkPrecedence" IN ('primary', 'secondary'))
+                                 NOT NULL DEFAULT 'primary',
+                "createdAt" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                "updatedAt" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                "deletedAt" TIMESTAMP WITH TIME ZONE
+            );
+        `);
+
+        console.log("Table ready.");
+    } catch (error) {
+        console.error("Database initialization failed:", error);
+        process.exit(1);
+    }
+}
+
 export default pool;
