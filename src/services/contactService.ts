@@ -1,3 +1,4 @@
+import { PoolClient } from "pg";
 import pool from "../database";
 
 interface Contact {
@@ -23,10 +24,11 @@ interface ConsolidatedContact {
     secondaryContactIds: number[];
 }
 
-export async function identify(request: IdentifyRequest): Promise<ConsolidatedContact> {
-    const email = request.email?.toString().trim().toLowerCase() || null;
-    const phoneNumber = request.phoneNumber?.toString().trim() || null;
-
+async function findMatchingContacts(
+    client: PoolClient,
+    email: string | null,
+    phoneNumber: string | null
+): Promise<Contact[]> {
     const conditions: string[] = [];
     const values: string[] = [];
 
@@ -39,7 +41,9 @@ export async function identify(request: IdentifyRequest): Promise<ConsolidatedCo
         values.push(phoneNumber);
     }
 
-    const { rows: matches } = await pool.query<Contact>(
+    if (conditions.length === 0) return [];
+
+    const { rows } = await client.query<Contact>(
         `SELECT * FROM contacts
          WHERE (${conditions.join(" OR ")})
          AND "deletedAt" IS NULL
@@ -47,59 +51,69 @@ export async function identify(request: IdentifyRequest): Promise<ConsolidatedCo
         values
     );
 
-    if (matches.length === 0) {
-        const { rows } = await pool.query<Contact>(
-            `INSERT INTO contacts ("phoneNumber", email, "linkPrecedence")
-             VALUES ($1, $2, 'primary')
-             RETURNING *`,
-            [phoneNumber, email]
-        );
+    return rows;
+}
 
-        const c = rows[0];
-        return {
-            primaryContactId: c.id,
-            emails: c.email ? [c.email] : [],
-            phoneNumbers: c.phoneNumber ? [c.phoneNumber] : [],
-            secondaryContactIds: [],
-        };
-    }
+async function resolvePrimary(
+    client: PoolClient,
+    contact: Contact
+): Promise<Contact> {
+    if (contact.linkPrecedence === "primary") return contact;
+    if (!contact.linkedId) return contact;
 
-    let primary = matches[0];
-    if (primary.linkPrecedence === "secondary" && primary.linkedId) {
-        const { rows } = await pool.query<Contact>(
-            `SELECT * FROM contacts WHERE id = $1 AND "deletedAt" IS NULL`,
-            [primary.linkedId]
-        );
-        if (rows.length > 0) primary = rows[0];
-    }
+    const { rows } = await client.query<Contact>(
+        `SELECT * FROM contacts WHERE id = $1 AND "deletedAt" IS NULL`,
+        [contact.linkedId]
+    );
 
-    const { rows: cluster } = await pool.query<Contact>(
+    if (rows.length === 0) return contact;
+    return resolvePrimary(client, rows[0]);
+}
+
+async function fetchCluster(
+    client: PoolClient,
+    primaryId: number
+): Promise<Contact[]> {
+    const { rows } = await client.query<Contact>(
         `SELECT * FROM contacts
          WHERE (id = $1 OR "linkedId" = $1)
          AND "deletedAt" IS NULL
          ORDER BY "createdAt" ASC`,
-        [primary.id]
+        [primaryId]
+    );
+    return rows;
+}
+
+async function mergePrimaries(
+    client: PoolClient,
+    primaries: Contact[]
+): Promise<Contact> {
+    primaries.sort(
+        (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
     );
 
-    const isNewEmail = email && !cluster.some((c) => c.email === email);
-    const isNewPhone = phoneNumber && !cluster.some((c) => c.phoneNumber === phoneNumber);
+    const truePrimary = primaries[0];
 
-    if (isNewEmail || isNewPhone) {
-        await pool.query(
-            `INSERT INTO contacts ("phoneNumber", email, "linkedId", "linkPrecedence")
-             VALUES ($1, $2, $3, 'secondary')`,
-            [phoneNumber, email, primary.id]
+    for (const demoted of primaries.slice(1)) {
+        await client.query(
+            `UPDATE contacts
+             SET "linkedId" = $1, "updatedAt" = NOW()
+             WHERE "linkedId" = $2 AND id != $1`,
+            [truePrimary.id, demoted.id]
+        );
+
+        await client.query(
+            `UPDATE contacts
+             SET "linkedId" = $1, "linkPrecedence" = 'secondary', "updatedAt" = NOW()
+             WHERE id = $2`,
+            [truePrimary.id, demoted.id]
         );
     }
 
-    const { rows: finalCluster } = await pool.query<Contact>(
-        `SELECT * FROM contacts
-         WHERE (id = $1 OR "linkedId" = $1)
-         AND "deletedAt" IS NULL
-         ORDER BY "createdAt" ASC`,
-        [primary.id]
-    );
+    return truePrimary;
+}
 
+function buildResponse(primary: Contact, cluster: Contact[]): ConsolidatedContact {
     const emails: string[] = [];
     const phoneNumbers: string[] = [];
     const secondaryContactIds: number[] = [];
@@ -107,7 +121,7 @@ export async function identify(request: IdentifyRequest): Promise<ConsolidatedCo
     if (primary.email) emails.push(primary.email);
     if (primary.phoneNumber) phoneNumbers.push(primary.phoneNumber);
 
-    for (const contact of finalCluster) {
+    for (const contact of cluster) {
         if (contact.id === primary.id) continue;
         secondaryContactIds.push(contact.id);
         if (contact.email && !emails.includes(contact.email)) emails.push(contact.email);
@@ -115,4 +129,65 @@ export async function identify(request: IdentifyRequest): Promise<ConsolidatedCo
     }
 
     return { primaryContactId: primary.id, emails, phoneNumbers, secondaryContactIds };
+}
+
+export async function identify(request: IdentifyRequest): Promise<ConsolidatedContact> {
+    const email = request.email?.toString().trim().toLowerCase() || null;
+    const phoneNumber = request.phoneNumber?.toString().trim() || null;
+
+    const client = await pool.connect();
+
+    try {
+        await client.query("BEGIN");
+
+        const matches = await findMatchingContacts(client, email, phoneNumber);
+
+        if (matches.length === 0) {
+            const { rows } = await client.query<Contact>(
+                `INSERT INTO contacts ("phoneNumber", email, "linkPrecedence")
+                 VALUES ($1, $2, 'primary')
+                 RETURNING *`,
+                [phoneNumber, email]
+            );
+            await client.query("COMMIT");
+            return buildResponse(rows[0], [rows[0]]);
+        }
+
+        const primaryMap = new Map<number, Contact>();
+
+        for (const contact of matches) {
+            const primary = await resolvePrimary(client, contact);
+            primaryMap.set(primary.id, primary);
+        }
+
+        const primaries = Array.from(primaryMap.values());
+
+        const truePrimary =
+            primaries.length > 1
+                ? await mergePrimaries(client, primaries)
+                : primaries[0];
+
+        const cluster = await fetchCluster(client, truePrimary.id);
+
+        const isNewEmail = email && !cluster.some((c) => c.email === email);
+        const isNewPhone = phoneNumber && !cluster.some((c) => c.phoneNumber === phoneNumber);
+
+        if (isNewEmail || isNewPhone) {
+            await client.query(
+                `INSERT INTO contacts ("phoneNumber", email, "linkedId", "linkPrecedence")
+                 VALUES ($1, $2, $3, 'secondary')`,
+                [phoneNumber, email, truePrimary.id]
+            );
+        }
+
+        const finalCluster = await fetchCluster(client, truePrimary.id);
+
+        await client.query("COMMIT");
+        return buildResponse(truePrimary, finalCluster);
+    } catch (err) {
+        await client.query("ROLLBACK");
+        throw err;
+    } finally {
+        client.release();
+    }
 }
