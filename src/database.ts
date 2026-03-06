@@ -41,10 +41,14 @@ export async function initDB(): Promise<void> {
                 "createdAt" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
                 "updatedAt" TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
                 "deletedAt" TIMESTAMP WITH TIME ZONE
-            );
+            )
         `);
 
-        console.log("Table ready.");
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_contacts_email ON contacts(email)`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_contacts_phone ON contacts("phoneNumber")`);
+        await pool.query(`CREATE INDEX IF NOT EXISTS idx_contacts_linked ON contacts("linkedId")`);
+
+        console.log("Tables and indexes ready.");
     } catch (error) {
         console.error("Database initialization failed:", error);
         process.exit(1);
