@@ -64,11 +64,55 @@ export async function identify(request: IdentifyRequest): Promise<ConsolidatedCo
         };
     }
 
-    const primary = matches[0];
-    return {
-        primaryContactId: primary.id,
-        emails: primary.email ? [primary.email] : [],
-        phoneNumbers: primary.phoneNumber ? [primary.phoneNumber] : [],
-        secondaryContactIds: [],
-    };
+    let primary = matches[0];
+    if (primary.linkPrecedence === "secondary" && primary.linkedId) {
+        const { rows } = await pool.query<Contact>(
+            `SELECT * FROM contacts WHERE id = $1 AND "deletedAt" IS NULL`,
+            [primary.linkedId]
+        );
+        if (rows.length > 0) primary = rows[0];
+    }
+
+    const { rows: cluster } = await pool.query<Contact>(
+        `SELECT * FROM contacts
+         WHERE (id = $1 OR "linkedId" = $1)
+         AND "deletedAt" IS NULL
+         ORDER BY "createdAt" ASC`,
+        [primary.id]
+    );
+
+    const isNewEmail = email && !cluster.some((c) => c.email === email);
+    const isNewPhone = phoneNumber && !cluster.some((c) => c.phoneNumber === phoneNumber);
+
+    if (isNewEmail || isNewPhone) {
+        await pool.query(
+            `INSERT INTO contacts ("phoneNumber", email, "linkedId", "linkPrecedence")
+             VALUES ($1, $2, $3, 'secondary')`,
+            [phoneNumber, email, primary.id]
+        );
+    }
+
+    const { rows: finalCluster } = await pool.query<Contact>(
+        `SELECT * FROM contacts
+         WHERE (id = $1 OR "linkedId" = $1)
+         AND "deletedAt" IS NULL
+         ORDER BY "createdAt" ASC`,
+        [primary.id]
+    );
+
+    const emails: string[] = [];
+    const phoneNumbers: string[] = [];
+    const secondaryContactIds: number[] = [];
+
+    if (primary.email) emails.push(primary.email);
+    if (primary.phoneNumber) phoneNumbers.push(primary.phoneNumber);
+
+    for (const contact of finalCluster) {
+        if (contact.id === primary.id) continue;
+        secondaryContactIds.push(contact.id);
+        if (contact.email && !emails.includes(contact.email)) emails.push(contact.email);
+        if (contact.phoneNumber && !phoneNumbers.includes(contact.phoneNumber)) phoneNumbers.push(contact.phoneNumber);
+    }
+
+    return { primaryContactId: primary.id, emails, phoneNumbers, secondaryContactIds };
 }
